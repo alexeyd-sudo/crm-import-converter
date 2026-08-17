@@ -1,3 +1,15 @@
-Flask>=3.0
-openpyxl>=3.1
-waitress>=3.0
+# Pinned exactly: a rebuild six months from now must install the versions this
+# was tested against. Transitive deps are pinned too, so `pip install -r` is
+# reproducible without a separate lock file.
+Flask==3.1.3
+openpyxl==3.1.5
+waitress==3.0.2
+gunicorn==26.0.0
+
+# transitive, pinned for reproducibility
+Werkzeug==3.1.8
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+click==8.4.2
+itsdangerous==2.2.0
+et-xmlfile==2.0.0

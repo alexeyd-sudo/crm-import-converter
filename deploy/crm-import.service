@@ -1,0 +1,63 @@
+; systemd unit for the CRM import converter.
+;
+;   install -d -m 0700 -o crmimport -g crmimport /var/lib/crm-import/uploads
+;   cp deploy/crm-import.service /etc/systemd/system/
+;   systemctl daemon-reload && systemctl enable --now crm-import
+;
+[Unit]
+Description=CRM import converter
+After=network.target
+
+[Service]
+Type=simple
+User=crmimport
+Group=crmimport
+WorkingDirectory=/opt/crm-import
+EnvironmentFile=-/etc/crm-import.env
+
+; EXACTLY ONE WORKER. Upload state lives in this process's memory, so a second
+; worker serves "Session not found" for every request that lands on the wrong
+; one - measured: 5 failures out of 20 with `gunicorn -w 2`. Threads are fine
+; (the state is behind a lock), but parsing is CPU-bound under the GIL, so more
+; than 2 only makes one client able to starve the others.
+ExecStart=/opt/crm-import/venv/bin/gunicorn \
+    --workers 1 \
+    --threads 2 \
+    --worker-class sync \
+    --bind 127.0.0.1:5101 \
+    --timeout 120 \
+    --graceful-timeout 30 \
+    --access-logfile - \
+    --error-logfile - \
+    --capture-output \
+    app:app
+
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+; This box runs other services. A hard ceiling means a hostile or careless
+; upload gets this unit killed instead of letting the kernel OOM-killer pick a
+; neighbour. converter.MAX_XLSX_UNCOMPRESSED x ~5 x MAX_SESSIONS is the budget.
+MemoryHigh=700M
+MemoryMax=1G
+TasksMax=64
+LimitNOFILE=1024
+
+; The service parses spreadsheets that arrive from outside.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/crm-import
+
+[Install]
+WantedBy=multi-user.target

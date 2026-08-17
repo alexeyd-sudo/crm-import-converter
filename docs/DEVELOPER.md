@@ -366,20 +366,36 @@ pins down a specific bug that was found in real data.
 py -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
-py app.py                       # http://localhost:5001, debug=True
+py app.py                       # http://127.0.0.1:5001 (FLASK_DEBUG=1 for the debugger)
 ```
 
 ### Production
 
+Copy-paste configuration is in [`deploy/`](../deploy/): systemd unit, env file,
+nginx vhost, tmpfiles rule.
+
 ```
-waitress-serve --host=0.0.0.0 --port=5001 --threads=4 app:app     # Windows and Linux
-gunicorn -w 1 -b 0.0.0.0:5001 app:app                             # Linux
+gunicorn --workers 1 --threads 2 --bind 127.0.0.1:5101 app:app
 ```
 
-Exactly **one worker** (see §5). Never run with `debug=True` in production.
+Exactly **one worker** (see §5). This is not advice, it is a correctness
+requirement: measured with `gunicorn -w 2`, 5 of 20 `/api/convert` calls returned
+`404 Session not found` because they landed on the process that never saw the
+upload. `--threads 2` rather than 4 because parsing is CPU-bound under the GIL,
+so a bigger pool only lets one client starve everyone else — with 4 threads busy,
+`/healthz` was measured blocked for 16 s.
 
-Environment variables: `PORT` (5001 here, 5000 in the Russian build),
-`SESSION_TTL_SECONDS` (6 h), `MAX_SESSIONS` (50).
+Never run `app.py` directly on a server. It binds to `127.0.0.1` and leaves the
+debugger off unless `FLASK_DEBUG=1`; setting that on a public host hands out
+remote code execution through the Werkzeug console.
+
+Environment variables — see the table in the README. Summary: `PORT`,
+`UPLOAD_DIR`, `SESSION_TTL_SECONDS`, `MAX_SESSIONS`, `MAX_CONTENT_LENGTH`,
+`MAX_XLSX_UNCOMPRESSED`, `MAX_ROWS`, `MAX_COLS`, `HOST`, `FLASK_DEBUG`.
+
+Put a hard `MemoryMax` on the unit. The service holds every live session's parsed
+table in RAM, so on a shared box a ceiling decides whether a careless upload gets
+*this* unit killed or lets the kernel OOM-killer pick a neighbouring service.
 
 ---
 
@@ -388,16 +404,40 @@ Environment variables: `PORT` (5001 here, 5000 in the Russian build),
 Done:
 
 * `session_id` is strictly `^[0-9a-f]{32}$`; path traversal is closed;
-* extension allow-list, 25 MB cap, row/column limits;
-* sessions and uploaded files expire — lead data does not sit around forever;
-* optional protection against CSV formula injection;
+* extension allow-list, upload cap, row/column limits — and, the one that
+  matters, a cap on the **uncompressed** size of the `.xlsx` archive, checked
+  from the ZIP directory before any XML is parsed. `MAX_ROWS` alone cannot stop
+  a memory blow-up: openpyxl builds its object model before a row count exists,
+  so the guard used to fire only after the RAM was already spent. A 70 KB file
+  expanding to 67 MB of XML was accepted;
+* every client-supplied mapping key is matched against `SOURCE_KEY_RE` and every
+  option is coerced to its expected type. Malformed JSON returns `400`, not the
+  `500` it used to — `int('abc')`, `mapping` as a list and a dict in
+  `source_value` were all reachable crashes;
+* session TTL is enforced on every request, not only at the next upload;
+* uploads live in `UPLOAD_DIR` (`0700`, files `0600`), configurable so that lead
+  data need not sit inside the code directory;
+* result files are written to a temporary name and `os.replace()`d into place, so
+  a download can never serve a half-written or mixed-conversion file;
+* downloads carry `Cache-Control: private, no-store`;
+* both CSV reports are **always** escaped against formula injection — they exist
+  to be opened in Excel, so that cannot be an option. The main CSV keeps the
+  opt-in switch, and phone-shaped values (`+` followed only by digits and
+  separators) are exempt, which is what made that option unusable before;
 * all HTML insertion points on the frontend go through `escapeHtml`.
 
-Deliberately not done (internal-network tool):
+Deliberately not done — **must be provided by the reverse proxy**
+(`deploy/nginx.conf` does all three):
 
 * **no authentication** — anyone who can reach the port can upload files and
-  download someone else's results if they know the `session_id`. Expose it only
-  behind a reverse proxy with basic auth / SSO;
-* no CSRF protection (the API is cookie-less, but the form is unprotected);
+  download someone else's results if they know the `session_id`. It handles
+  customer contact details, so basic auth / SSO in front is mandatory, not
+  optional;
+* no CSRF protection. The API is cookie-less, so there is nothing to steal, but
+  `multipart/form-data` is a CORS-simple content type: a third-party page can
+  make a visitor's browser POST to `/api/upload` and burn server CPU. Rate
+  limiting in the proxy is what contains this;
 * no rate limiting;
-* `openpyxl` parses arbitrary `.xlsx` — trust the source of your files.
+* `openpyxl` parses arbitrary `.xlsx`. It does not execute formulas or VBA, and
+  XXE was verified closed, so the realistic risk is resource consumption — which
+  is what `MAX_XLSX_UNCOMPRESSED` plus `MemoryMax` are for.

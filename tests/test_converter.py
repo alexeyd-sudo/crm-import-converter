@@ -419,7 +419,14 @@ def test_formula_sanitizing():
     safe = C.records_to_rows(recs, sanitize_formulas=True)[0]
     assert plain[0] == '=cmd|calc'
     assert safe[0] == "'=cmd|calc"
-    assert safe[2] == "'+52 331 111 1111"
+    # A phone number is not a formula: '+' followed only by digits and
+    # separators cannot execute. Quoting it used to make this option unusable
+    # for a CRM import, so phone-shaped values are left alone.
+    assert safe[2] == '+52 331 111 1111'
+    assert C._escape_formula('+52 (33) 1234-5678') == '+52 (33) 1234-5678'
+    assert C._escape_formula('+SUM(A1:A2)') == "'+SUM(A1:A2)"
+    assert C._escape_formula('-1+1') == "'-1+1"
+    assert C._escape_formula('@import') == "'@import"
 
 
 def test_suggest_mapping_spills_extra_phone_columns():
@@ -489,6 +496,194 @@ def test_real_file_regression():
     assert len(groups) > 40
     # websites typed into the phone column were rescued, not dropped
     assert any(f['kind'] == 'url' for f in fixes)
+
+
+# ---------------------------------------------------------------------------
+# regressions from the pre-deployment audit
+# ---------------------------------------------------------------------------
+
+def test_national_number_is_not_given_an_invented_country_code():
+    """'+449 478 2400' reads as the UK; the source was a local Mexican number.
+    A number that cannot be resolved must be reported, not guessed."""
+    for national in ('449 478 2400', '6269-5539', '99100 4325', '098 554 7600'):
+        value, status = C.normalize_phone(national)
+        assert status == 'needs_cc', (national, value, status)
+        assert not value.startswith('+'), value
+    # long enough to already carry a country code -> '+' is safe
+    assert C.normalize_phone('522283535262') == ('+522283535262', 'fixed')
+    assert C.normalize_phone('5215636045672')[1] == 'fixed'
+    # too short to be a phone number at all
+    assert C.normalize_phone('12345')[1] == 'invalid'
+
+
+def test_default_country_code_strips_the_national_trunk_prefix():
+    """A leading 0 is a domestic dialling prefix, never part of E.164."""
+    value, status = C.normalize_phone('098 554 7600', '52')
+    assert status == 'cc_added'
+    assert value == '+52 98 554 7600', value
+    assert not value.startswith('+520')
+
+
+def test_no_undialable_number_survives_normalization():
+    """Nothing that starts with '+' may be shorter than 10 digits or begin +0."""
+    samples = ['449 478 2400', '6269-5539', '+52 33 1234 5678', '00 52 33 1234 5678',
+               '098 554 7600', '5215636045672', '99172 5715', '123244360']
+    for cc in (None, '52'):
+        for raw in samples:
+            value, _status = C.normalize_phone(raw, cc)
+            if value.startswith('+'):
+                digits = ''.join(ch for ch in value if ch.isdigit())
+                assert not value.startswith('+0'), (raw, cc, value)
+                assert len(digits) >= 10, (raw, cc, value)
+
+
+def test_cp1252_input_is_not_decoded_as_cp1251():
+    """Both codepages decode any byte, so 'try in order' silently mangled
+    Spanish lead lists: 'Clínica México' became 'Clнnica Mйxico'."""
+    raw = 'Company;Comment\r\nClínica México;José\r\n'.encode('cp1252')
+    text, enc = C.decode_csv_bytes(raw)
+    assert enc == 'cp1252', enc
+    assert 'Clínica México' in text and 'José' in text
+    # a genuinely Cyrillic CP1251 file must still decode as CP1251
+    raw_ru = 'Компания;Коммент\r\nКлиника;Иван\r\n'.encode('cp1251')
+    text_ru, enc_ru = C.decode_csv_bytes(raw_ru)
+    assert enc_ru == 'cp1251' and 'Клиника' in text_ru
+    # UTF-8 still wins outright, before any single-byte codepage is considered
+    assert C.decode_csv_bytes('a;b\r\nñ;é\r\n'.encode('utf-8'))[1].startswith('utf-8')
+
+
+def test_merging_does_not_split_free_text_on_commas():
+    """Comment is prose: a comma is punctuation, not a value separator.
+    Splitting it de-duplicated words away ('urgent' vanished)."""
+    _recs, _fixes, merged, _groups = run_pipeline(
+        [['Company', 'Comment'],
+         ['Acme', 'Call Monday, urgent'],
+         ['Acme', 'Call Tuesday, urgent']],
+        mapping={'0': 'company_lead', '1': 'comment'})
+    assert len(merged) == 1
+    assert merged[0]['Comment'] == 'Call Monday, urgent, Call Tuesday, urgent'
+    # phones DO still get split and collapsed - they really are a list, and the
+    # same number appearing in both rows must survive only once
+    _r, _f, merged2, _g = run_pipeline(
+        [['Company', 'Phone'],
+         ['Acme', '+52 33 1111 1111'],
+         ['Acme', '+52 33 1111 1111, +52 33 2222 2222']],
+        mapping={'0': 'company_lead', '1:0': 'mobile_phone', '1:1': 'mobile_phone'})
+    assert merged2[0]['Mobile Phone'].count('+') == 2, merged2[0]['Mobile Phone']
+
+
+def test_reports_are_always_protected_from_formulas():
+    """The two reports exist to be opened in Excel, so their escaping cannot be
+    an option the operator might have switched off."""
+    groups = [{'name': '=cmd|calc', 'size': 2, 'rows': [2, 3],
+               'names': ['=cmd|calc', '@SUM(A1)'], 'matched_on': ['name']}]
+    for cell in C.duplicates_report_rows(groups)[0]:
+        assert not str(cell).startswith(('=', '@')), cell
+    fixes = [{'row': 2, 'column': '=evil', 'kind': 'email', 'value': '=cmd|calc',
+              'from': 'work_email', 'to': 'home_email', 'action': 'moved'}]
+    for cell in C.fixes_report_rows(fixes)[0]:
+        assert not str(cell).startswith(('=', '@')), cell
+
+
+def test_client_supplied_mapping_keys_are_validated():
+    """These came straight from the browser and each one used to be a 500."""
+    headers, rows = ['Company'], [['Acme']]
+    hyp = [[None]]
+    for bad in ('abc', '1:2:3', '2:x', '-1', '', '1:', ':1', '99999'):
+        try:
+            C.build_records(headers, rows, hyp, {}, {bad: 'company_lead'})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted invalid key {bad!r}')
+    # the legitimate shapes still work
+    assert C.SOURCE_KEY_RE.match('0') and C.SOURCE_KEY_RE.match('12:3')
+
+
+def test_hostile_option_types_do_not_crash():
+    """options arrives as JSON; a list or a dict in the wrong place used to be
+    an AttributeError deep inside csv writing."""
+    try:
+        C.normalize_options(['not', 'an', 'object'])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('accepted a list as options')
+    o = C.normalize_options({'source_value': {'a': 1}, 'autofix_types': 'yes',
+                             'dedupe_by_name': None, 'default_country_code': 'MX52X'})
+    assert isinstance(o['source_value'], str) and len(o['source_value']) <= 100
+    assert o['autofix_types'] is True and o['dedupe_by_name'] is False
+    assert o['default_country_code'] == '52'
+
+
+def test_xlsx_is_rejected_on_uncompressed_size_before_parsing():
+    """MAX_ROWS cannot protect anything: openpyxl builds its object model before
+    a row count exists. The uncompressed size is the only guard that fires first."""
+    import zipfile
+    fd, path = tempfile.mkstemp(suffix='.xlsx')
+    os.close(fd)
+    try:
+        rows = ''.join(f'<row r="{i}"><c r="A{i}" t="inlineStr"><is><t>{"x" * 40}</t>'
+                       f'</is></c></row>' for i in range(1, 30001))
+        sheet = ('<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org'
+                 f'/spreadsheetml/2006/main"><sheetData>{rows}</sheetData></worksheet>')
+        with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.writestr('xl/worksheets/sheet1.xml', sheet)
+        assert os.path.getsize(path) < 200 * 1024, 'compressed payload should be small'
+        limit = C.MAX_XLSX_UNCOMPRESSED
+        C.MAX_XLSX_UNCOMPRESSED = 1024          # pretend the cap is tiny
+        try:
+            C.check_xlsx_archive(path)
+        except C.TableTooLargeError as e:
+            assert 'unpacks to' in str(e)
+        else:
+            raise AssertionError('oversized archive was accepted')
+        finally:
+            C.MAX_XLSX_UNCOMPRESSED = limit
+    finally:
+        os.unlink(path)
+
+
+def test_non_zip_named_xlsx_is_read_as_csv():
+    """Operators do rename a CSV to .xlsx. Reading it beats 'not a zip file'."""
+    fd, path = tempfile.mkstemp(suffix='.xlsx')
+    os.close(fd)
+    try:
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            f.write('Company;Phone\r\nAcme;+52 33 1234 5678\r\n')
+        headers, rows, _hyp = C.read_table(path, 'renamed.xlsx')
+        assert headers == ['Company', 'Phone'] and rows == [['Acme', '+52 33 1234 5678']]
+    finally:
+        os.unlink(path)
+
+
+def test_too_many_columns_is_an_error_not_a_silent_truncation():
+    limit = C.MAX_COLS
+    C.MAX_COLS = 5
+    try:
+        path = make_csv([[f'C{i}' for i in range(8)], [f'v{i}' for i in range(8)]])
+        try:
+            C.read_table(path, 'x.csv')
+        except C.TableTooLargeError as e:
+            assert 'columns' in str(e)
+        else:
+            raise AssertionError('extra columns were dropped silently')
+        finally:
+            os.unlink(path)
+    finally:
+        C.MAX_COLS = limit
+
+
+def test_phone_only_duplicate_groups_are_identifiable():
+    """A shared switchboard number merges unrelated companies, so the UI has to
+    be able to single those groups out for a human to check."""
+    _r, _f, _merged, groups = run_pipeline(
+        [['Company', 'Phone'],
+         ['Supliestetica Oriental', '+1 809 555 1234'],
+         ['Dermclar Republica', '+1 809 555 1234']],
+        mapping={'0': 'company_lead', '1:0': 'mobile_phone'})
+    assert len(groups) == 1
+    assert groups[0]['matched_on'] == ['phone']
 
 
 # ---------------------------------------------------------------------------

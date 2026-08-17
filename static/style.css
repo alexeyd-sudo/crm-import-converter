@@ -168,6 +168,11 @@ table.preview th, table.preview td {
 }
 table.preview th { background: #fafbfc; }
 
+/* Groups merged on a phone match alone: a shared switchboard number can pull
+   two unrelated companies into one row, so they are flagged for a human. */
+tr.needs-review { background: #fff8e6; }
+tr.needs-review b { color: #7a4a05; }
+
 /* --- warnings ------------------------------------------------------- */
 .warnings { margin-bottom: 14px; }
 .warn {
