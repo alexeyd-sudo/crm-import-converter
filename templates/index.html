@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CRM Import Converter</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Lead table converter for CRM import</h1>
+    <p class="sub">Upload an Excel/CSV file, map its columns to CRM fields and get a ready-to-import file.</p>
+  </header>
+
+  <div class="steps">
+    <div class="step-dot active" data-step="1">1. File</div>
+    <div class="step-dot" data-step="2">2. Scanning</div>
+    <div class="step-dot" data-step="3">3. Field mapping</div>
+    <div class="step-dot" data-step="4">4. Result</div>
+  </div>
+
+  <section id="step-upload" class="panel active">
+    <form id="upload-form">
+      <label class="dropzone" id="dropzone">
+        <input type="file" id="file-input" name="file" accept=".xlsx,.xlsm,.csv,.txt" hidden>
+        <div class="dz-text">
+          <strong>Drop a file here</strong> or click to choose one
+          <div class="dz-hint">.xlsx, .xlsm or .csv</div>
+        </div>
+        <div class="dz-filename" id="dz-filename"></div>
+      </label>
+      <button type="submit" class="btn primary" id="upload-btn" disabled>Upload and scan</button>
+    </form>
+    <div id="upload-error" class="error"></div>
+  </section>
+
+  <section id="step-scan" class="panel">
+    <div class="spinner-block" id="scan-spinner">
+      <div class="spinner"></div>
+      <p>Reading the file, detecting value types and parsing phone numbers…</p>
+    </div>
+  </section>
+
+  <section id="step-map" class="panel">
+    <p class="hint">
+      For every column of the source file choose the CRM field it should go into.
+      The pre-selected values are guesses based on the column header and on what is
+      actually inside the column — please check them.
+      The <b>Source</b> field is filled automatically and is not listed here.
+    </p>
+
+    <div id="warnings" class="warnings"></div>
+    <div id="phone-summary" class="phone-summary"></div>
+    <div id="mapping-table" class="mapping-table"></div>
+
+    <details class="options" open>
+      <summary>Processing options</summary>
+      <div class="opt-grid">
+        <label class="opt">
+          <input type="checkbox" id="opt-autofix" checked>
+          <span>
+            <b>Fix values in the wrong column</b>
+            <em>An e-mail typed into the phone column goes to E-mail, a link goes to
+            Website, a number found in the website column goes to Phone. The type is
+            decided by the content: “@” means e-mail, digits only mean phone,
+            a dotted domain means website.</em>
+          </span>
+        </label>
+
+        <label class="opt">
+          <input type="checkbox" id="opt-skip-noname">
+          <span><b>Skip rows without a company name</b>
+          <em>Rows with an empty Company Name are left out of the result.</em></span>
+        </label>
+
+        <label class="opt">
+          <input type="checkbox" id="opt-formulas">
+          <span><b>Excel formula protection</b>
+          <em>Values starting with <code>=</code>, <code>+</code>, <code>-</code>, <code>@</code>
+          get a leading <code>'</code>. Enable only if the file will be opened in Excel —
+          for a CRM import it is usually unwanted (phone numbers start with “+”).</em></span>
+        </label>
+
+        <label class="opt inline">
+          <span><b>Default country code</b>
+          <em>Applied to numbers with no “+” and no country code. For example <code>52</code> —
+          Mexico, <code>57</code> — Colombia. Leave empty to skip.</em></span>
+          <input type="text" id="opt-cc" class="text-input" placeholder="e.g. 52" inputmode="numeric">
+        </label>
+      </div>
+
+      <div class="opt-title">Output encoding</div>
+      <div class="opt-grid">
+        <label class="opt inline">
+          <span><b>CSV encoding</b>
+          <em id="enc-hint"></em></span>
+          <select id="opt-encoding" class="text-input"></select>
+        </label>
+
+        <label class="opt">
+          <input type="checkbox" id="opt-translit">
+          <span><b>Transliterate accented characters</b>
+          <em><code>México → Mexico</code>, <code>Estética → Estetica</code>, <code>ā → a</code>.
+          The file becomes pure ASCII, which no re-encoding can corrupt.
+          Enable this if the CRM shows <code>?</code> or <code>Ã©</code> instead of letters.
+          Cyrillic is left untouched.</em></span>
+        </label>
+      </div>
+
+      <div class="opt-title">Duplicate merging (affects the clean file only)</div>
+      <div class="opt-grid dedupe-grid">
+        <label class="opt"><input type="checkbox" id="opt-dup-name" checked>
+          <span><b>By company name</b><em>Handles the parenthesised handle:
+          <code>Alpha (alpha_mx)</code> = <code>alpha_mx</code>.</em></span></label>
+        <label class="opt"><input type="checkbox" id="opt-dup-email" checked>
+          <span><b>By e-mail</b><em>Any address shared between two rows.</em></span></label>
+        <label class="opt"><input type="checkbox" id="opt-dup-phone" checked>
+          <span><b>By phone</b><em>The last 9 digits are compared, so a number with and
+          without a country code counts as one. Careful: different companies may share
+          a number.</em></span></label>
+        <label class="opt"><input type="checkbox" id="opt-dup-site">
+          <span><b>By website</b><em>The domain; for social networks the domain plus the
+          account. Off by default: several companies can share one aggregator site.</em></span></label>
+      </div>
+    </details>
+
+    <button class="btn primary" id="convert-btn">Build CSV</button>
+    <div id="convert-error" class="error"></div>
+  </section>
+
+  <section id="step-result" class="panel">
+    <div id="result-summary"></div>
+
+    <div class="download-cards">
+      <div class="dl-card">
+        <div class="dl-title">Clean file (duplicates merged)</div>
+        <div class="dl-meta" id="dl-merged-meta"></div>
+        <a id="download-merged" class="btn primary" href="#" download>Download clean CSV</a>
+      </div>
+      <div class="dl-card">
+        <div class="dl-title">Full file (as in the source, with duplicates)</div>
+        <div class="dl-meta" id="dl-raw-meta"></div>
+        <a id="download-raw" class="btn" href="#" download>Download CSV with duplicates</a>
+      </div>
+    </div>
+
+    <div class="report-links">
+      <a id="download-dups" class="link" href="#" download>Report: which rows were merged</a>
+      <a id="download-fixes" class="link" href="#" download>Report: which values were moved between fields</a>
+    </div>
+
+    <div id="result-details"></div>
+
+    <div class="preview-switch">
+      <button class="btn small active" data-preview="merged">Preview: clean</button>
+      <button class="btn small" data-preview="raw">Preview: with duplicates</button>
+    </div>
+    <div id="result-preview"></div>
+
+    <button class="btn" id="restart-btn">Upload another file</button>
+  </section>
+</div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
