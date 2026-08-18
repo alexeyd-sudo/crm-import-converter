@@ -41,6 +41,13 @@ set PORT=5050 && py app.py
    several numbers is split into sub-columns `— Phone 1`, `— Phone 2`, … which
    can be mapped to different CRM fields.
 
+   A number that has no `+` and is short enough to be a *national* number is
+   left exactly as it came and reported instead of being guessed. Prefixing `+`
+   would invent a country: the local Mexican number `449 478 2400` becomes
+   `+449 478 2400`, which reads as the United Kingdom — a plausible-looking
+   number nobody can dial, which is worse than an unformatted one. Set the
+   **default country code** on step 3 to resolve those properly.
+
 3. **Field mapping.** The target fields are pre-selected automatically (from
    the header wording and from the actual content) — check them. Targets:
 
@@ -113,23 +120,43 @@ py tests\test_converter.py       # 40 tests, no dependencies
 
 ## Production
 
+Ready-to-use configuration lives in [`deploy/`](deploy/): a systemd unit, an
+environment file, an nginx vhost and a tmpfiles rule.
+
 ```
-waitress-serve --host=0.0.0.0 --port=5001 --threads=4 app:app
+gunicorn --workers 1 --threads 2 --bind 127.0.0.1:5101 app:app
 ```
 
-Use exactly **1 worker** — session state lives in process memory.
+Use exactly **1 worker** — session state lives in process memory, and a second
+worker answers "Session not found" for every request that lands on it.
 Details and environment variables in [docs/DEVELOPER.md](docs/DEVELOPER.md).
+
+**Do not run `app.py` directly on a server.** It is the development entry point;
+it binds to loopback and keeps the debugger off unless `FLASK_DEBUG=1`.
 
 ## Limits
 
-* Max upload 25 MB (`MAX_CONTENT_LENGTH` in `app.py`), 200 000 rows and
-  300 columns (`MAX_ROWS`/`MAX_COLS` in `converter.py`).
-* Sessions live 6 hours, then they are deleted together with the uploaded file
-  (`SESSION_TTL_SECONDS`).
-* At most 5 phone numbers are taken from one cell (`MAX_PHONES_PER_CELL`);
-  anything above that is reported as a warning rather than dropped silently.
-* **There is no authentication** — this is an internal-network tool. Put it
-  behind a reverse proxy with auth before exposing it.
+All of these are environment variables — the defaults are sized for the real
+workload (lead lists of hundreds of rows), not for the largest file that could
+technically be parsed.
+
+| Variable | Default | What it protects |
+|---|---|---|
+| `MAX_XLSX_UNCOMPRESSED` | 24 MB | **the important one.** A `.xlsx` is a ZIP: 1.4 MB of file can hold 42 MB of sheet XML. Every MB of that XML costs ~0.42 s of CPU and ~5 MB of RAM, so this single cap bounds both — and closes the zip-bomb hole. `MAX_ROWS` cannot: openpyxl builds its whole object model before a row count exists. |
+| `MAX_CONTENT_LENGTH` | 8 MB | upload size. Keep nginx's `client_max_body_size` identical. |
+| `MAX_ROWS` / `MAX_COLS` | 20 000 / 100 | secondary sanity limits. Exceeding either is an **error**, not a silent truncation. |
+| `MAX_SESSIONS` | 8 | uploads held in RAM at once. This is a memory setting: budget `MAX_SESSIONS × MAX_XLSX_UNCOMPRESSED × ~5`. |
+| `SESSION_TTL_SECONDS` | 7200 | how long an upload stays downloadable. Enforced on **every** request, not only at the next upload. |
+| `UPLOAD_DIR` | `./uploads` | where uploaded tables land. Point it outside the code directory — it holds personal data (`0700`, files `0600`). |
+
+Other limits, not configurable: at most 5 phone numbers are taken from one cell
+(`MAX_PHONES_PER_CELL`), and anything above that is reported as a warning rather
+than dropped silently. Only the active worksheet is imported; a workbook with a
+second *populated* sheet is rejected rather than silently half-read.
+
+* **There is no authentication** — put it behind a reverse proxy with basic auth
+  or an IP allow-list before exposing it. `deploy/nginx.conf` does this.
+  It handles customer contact details, so this is not optional.
 
 ## Localisation
 

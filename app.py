@@ -21,17 +21,25 @@ import uuid
 import threading
 
 from flask import Flask, request, jsonify, render_template, send_file, abort
+from werkzeug.exceptions import HTTPException
 
 import converter
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Uploaded lead tables are personal data and must not live inside the code
+# directory: on a server /opt is root-owned and read-only for the service user.
+UPLOAD_DIR = os.environ.get('UPLOAD_DIR', os.path.join(BASE_DIR, 'uploads'))
+os.makedirs(UPLOAD_DIR, mode=0o700, exist_ok=True)
 
 ALLOWED_EXT = {'.xlsx', '.xlsm', '.csv', '.txt'}
-MAX_CONTENT_LENGTH = 25 * 1024 * 1024  # 25 MB
-SESSION_TTL_SECONDS = int(os.environ.get('SESSION_TTL_SECONDS', 6 * 3600))
-MAX_SESSIONS = int(os.environ.get('MAX_SESSIONS', 50))
+# 8 MB of compressed upload is already ~200 MB of sheet XML; converter.py caps
+# the uncompressed size separately, which is the limit that actually bounds
+# CPU and RAM. See MAX_XLSX_UNCOMPRESSED there.
+MAX_CONTENT_LENGTH = int(os.environ.get('MAX_CONTENT_LENGTH', 8 * 1024 * 1024))
+SESSION_TTL_SECONDS = int(os.environ.get('SESSION_TTL_SECONDS', 2 * 3600))
+# Each session holds the whole parsed table in RAM until it expires, so this
+# is a memory setting, not a comfort setting: cap * MAX_XLSX_UNCOMPRESSED * ~5.
+MAX_SESSIONS = int(os.environ.get('MAX_SESSIONS', 8))
 
 # Default port. The Russian and English builds of this service must listen
 # on DIFFERENT ports, otherwise the second one to start dies with
@@ -62,8 +70,26 @@ SESSIONS_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def _drop_session(session_id):
+    """Caller must NOT hold SESSIONS_LOCK: rmtree is blocking disk I/O and
+    would stall every other request while it runs."""
     SESSIONS.pop(session_id, None)
     shutil.rmtree(os.path.join(UPLOAD_DIR, session_id), ignore_errors=True)
+
+
+def get_live_session(session_id):
+    """Fetch a session, enforcing the TTL here rather than only at the next
+    upload - otherwise an expired session keeps serving lead data for as long
+    as nobody uploads a new file."""
+    now = time.time()
+    with SESSIONS_LOCK:
+        session = SESSIONS.get(session_id)
+        expired = bool(session) and now - session['created'] > SESSION_TTL_SECONDS
+        if expired:
+            SESSIONS.pop(session_id, None)
+    if expired:
+        shutil.rmtree(os.path.join(UPLOAD_DIR, session_id), ignore_errors=True)
+        return None
+    return session
 
 
 def cleanup_sessions():
@@ -72,14 +98,18 @@ def cleanup_sessions():
     should not linger on disk either."""
     now = time.time()
     with SESSIONS_LOCK:
-        stale = [sid for sid, s in SESSIONS.items()
-                 if now - s['created'] > SESSION_TTL_SECONDS]
-        for sid in stale:
-            _drop_session(sid)
-        if len(SESSIONS) > MAX_SESSIONS:
-            oldest = sorted(SESSIONS.items(), key=lambda kv: kv[1]['created'])
-            for sid, _ in oldest[:len(SESSIONS) - MAX_SESSIONS]:
-                _drop_session(sid)
+        doomed = [sid for sid, s in SESSIONS.items()
+                  if now - s['created'] > SESSION_TTL_SECONDS]
+        for sid in doomed:
+            SESSIONS.pop(sid, None)
+        # `>=` because this runs just BEFORE a new session is added, so `>`
+        # left room for MAX_SESSIONS + 1 to be resident.
+        while len(SESSIONS) >= MAX_SESSIONS:
+            oldest = min(SESSIONS, key=lambda sid: SESSIONS[sid]['created'])
+            SESSIONS.pop(oldest, None)
+            doomed.append(oldest)
+    for sid in doomed:
+        shutil.rmtree(os.path.join(UPLOAD_DIR, sid), ignore_errors=True)
 
     # orphan directories left behind by a previous process
     cutoff = now - SESSION_TTL_SECONDS
@@ -112,9 +142,9 @@ def index():
 
 @app.route('/healthz')
 def healthz():
-    with SESSIONS_LOCK:
-        n = len(SESSIONS)
-    return jsonify({'status': 'ok', 'sessions': n})
+    # Deliberately says nothing about load: this endpoint is reachable without
+    # auth so a probe can use it, and the session count is nobody else's business.
+    return jsonify({'status': 'ok'})
 
 
 @app.route('/api/upload', methods=['POST'])
@@ -129,22 +159,29 @@ def upload():
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXT:
         return jsonify({'error': f'Unsupported file type: {ext or "unknown"}. '
-                                 f'Supported formats: .xlsx, .xlsm, .csv'}), 400
+                                 f'Supported formats: '
+                                 f'{", ".join(sorted(ALLOWED_EXT))}.'}), 400
 
     session_id = uuid.uuid4().hex
     session_dir = _session_dir(session_id)
-    os.makedirs(session_dir, exist_ok=True)
+    os.makedirs(session_dir, mode=0o700, exist_ok=True)
     src_path = os.path.join(session_dir, 'source' + ext)
     file.save(src_path)
+    os.chmod(src_path, 0o600)
 
     try:
         headers, rows, hyperlinks = converter.read_table(src_path, filename)
     except converter.TableTooLargeError as e:
         shutil.rmtree(session_dir, ignore_errors=True)
         return jsonify({'error': str(e)}), 400
-    except Exception as e:
+    except Exception:
+        # The exception text can carry server paths, so it goes to the log and
+        # the client gets a generic message.
+        app.logger.exception('could not read uploaded file %r', filename)
         shutil.rmtree(session_dir, ignore_errors=True)
-        return jsonify({'error': f'Could not read the file: {e}'}), 400
+        return jsonify({'error': 'Could not read the file. Check that it is a '
+                                 'valid spreadsheet and that the first row holds '
+                                 'the column headers.'}), 400
 
     if not headers or not rows:
         shutil.rmtree(session_dir, ignore_errors=True)
@@ -209,9 +246,15 @@ def _upload_warnings(headers, rows, phone_data, col_stats):
                        f'{st["foreign_urls"]} links - they will be moved '
                        f'to a Website field.')
         if st['fixed']:
-            out.append(f'{st["fixed"]} numbers had no "+" and no country code - the code '
-                       f'was guessed from the number itself. If you know the country, '
-                       f'set a default country code on the mapping step.')
+            out.append(f'{st["fixed"]} numbers had no "+" but were long enough to already '
+                       f'contain a country code, so "+" was added.')
+        if st['needs_cc']:
+            out.append(f'{st["needs_cc"]} numbers in "{headers[c]}" are national numbers '
+                       f'with no country code. They are kept exactly as they came, '
+                       f'WITHOUT a "+", because guessing would invent a country: '
+                       f'"449 478 2400" would become "+449 478 2400", which reads as '
+                       f'the United Kingdom. Set the default country code below to fix '
+                       f'them - otherwise the CRM gets numbers nobody can dial.')
     for st in col_stats:
         if st['nonempty'] and st['dominant'] and st['share'] < 0.7:
             out.append(f'Column "{st["header"]}" is mixed: '
@@ -222,7 +265,9 @@ def _upload_warnings(headers, rows, phone_data, col_stats):
 
 @app.route('/api/convert', methods=['POST'])
 def convert():
-    data = request.get_json(force=True, silent=True) or {}
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Expected a JSON object.'}), 400
     session_id = data.get('session_id') or ''
     mapping = data.get('mapping') or {}
     options = data.get('options') or {}
@@ -230,10 +275,25 @@ def convert():
     if not SESSION_ID_RE.match(session_id):
         return jsonify({'error': 'Invalid session id.'}), 400
 
-    with SESSIONS_LOCK:
-        session = SESSIONS.get(session_id)
+    # Everything below arrives from the browser, so nothing about its shape is
+    # guaranteed. Each of these used to be an unhandled 500.
+    if not isinstance(mapping, dict) or not isinstance(options, dict):
+        return jsonify({'error': 'mapping and options must be JSON objects.'}), 400
+    bad_keys = [k for k in mapping if not converter.SOURCE_KEY_RE.match(str(k))]
+    if bad_keys:
+        return jsonify({'error': f'Invalid source column key: {bad_keys[0]!r}'}), 400
+    bad_targets = [v for v in mapping.values() if v and v not in converter.TARGET_BY_ID]
+    if bad_targets:
+        return jsonify({'error': f'Unknown CRM field: {bad_targets[0]!r}'}), 400
+
+    session = get_live_session(session_id)
     if not session:
         return jsonify({'error': 'Session not found or expired. Please upload the file again.'}), 404
+
+    unknown = [k for k in mapping if k not in session['labels']]
+    if unknown:
+        return jsonify({'error': f'Column {unknown[0]!r} is not part of the uploaded '
+                                 f'file. Please upload it again.'}), 400
 
     if not any(mapping.values()):
         return jsonify({'error': 'No source column was mapped to a CRM field.'}), 400
@@ -306,6 +366,7 @@ def convert():
         'duplicates': {
             'group_count': len(groups),
             'collapsed_rows': len(records) - len(merged),
+            'review_count': sum(1 for g in groups if g['matched_on'] == ['phone']),
             'download_url': f'/download/{session_id}/duplicates',
             'groups': groups[:50],
         },
@@ -339,6 +400,8 @@ def download(session_id, kind='raw'):
         abort(404)
     if kind not in ARTIFACTS:
         abort(404)
+    if not get_live_session(session_id):
+        abort(404)
     fname, download_name = ARTIFACTS[kind]
     path = os.path.join(_session_dir(session_id), fname)
     if not os.path.isfile(path):
@@ -346,14 +409,20 @@ def download(session_id, kind='raw'):
     # Reports are always UTF-8+BOM; the two result files follow the operator's
     # choice. Declaring the charset helps anything that fetches over HTTP.
     if kind in ('raw', 'merged'):
-        with SESSIONS_LOCK:
-            session = SESSIONS.get(session_id)
-        charset = (session or {}).get('encoding') or converter.CSV_ENCODING
+        session = SESSIONS.get(session_id) or {}
+        charset = session.get('encoding') or converter.CSV_ENCODING
     else:
         charset = 'utf-8-sig'
     charset = 'utf-8' if charset == 'utf-8-sig' else charset
-    return send_file(path, as_attachment=True, download_name=download_name,
-                     mimetype=f'text/csv; charset={charset}')
+    resp = send_file(path, as_attachment=True, download_name=download_name,
+                     mimetype='text/csv')
+    # Setting the charset via `mimetype` makes Werkzeug append its own default
+    # too, producing "text/csv; charset=cp1251; charset=utf-8" - a contradiction
+    # that decodes to mojibake in any client that reads the last parameter.
+    resp.headers['Content-Type'] = f'text/csv; charset={charset}'
+    # The file holds customer contact details: no shared cache should keep it.
+    resp.headers['Cache-Control'] = 'private, no-store'
+    return resp
 
 
 @app.errorhandler(413)
@@ -362,5 +431,25 @@ def too_large(_e):
     return jsonify({'error': f'File is larger than {mb} MB.'}), 413
 
 
+@app.errorhandler(ValueError)
+def bad_input(e):
+    """converter raises ValueError for input it refuses to trust."""
+    return jsonify({'error': str(e)}), 400
+
+
+@app.errorhandler(Exception)
+def unhandled(e):
+    """The frontend parses every response as JSON, so an HTML 500 page shows up
+    as an unreadable error. Anything unexpected still gets logged in full."""
+    if isinstance(e, HTTPException):
+        return e
+    app.logger.exception('unhandled error on %s', request.path)
+    return jsonify({'error': 'Internal error. Please try again.'}), 500
+
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=PORT, debug=True)
+    # Development entry point. debug=True would expose the Werkzeug debugger
+    # console - arbitrary code execution - so it has to be asked for explicitly,
+    # and the default bind is loopback, not every interface.
+    app.run(host=os.environ.get('HOST', '127.0.0.1'), port=PORT,
+            debug=os.environ.get('FLASK_DEBUG') == '1')

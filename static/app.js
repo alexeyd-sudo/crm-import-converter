@@ -297,11 +297,21 @@
 
     if (data.duplicates.groups.length) {
       html += '<details class="report"><summary>Merged duplicates ' +
-        `(${data.duplicates.group_count}, showing the first ${data.duplicates.groups.length})</summary>` +
-        '<table class="preview"><thead><tr><th>Company</th><th>Rows</th>' +
+        `(${data.duplicates.group_count}, showing the first ${data.duplicates.groups.length})</summary>`;
+      if (data.duplicates.review_count) {
+        html += `<div class="warn">${data.duplicates.review_count} group(s) were merged on a ` +
+          `matching phone number ALONE, with no matching name, e-mail or website. ` +
+          `Two different companies can share a switchboard or a distributor's number, ` +
+          `so those rows are marked <b>check</b> below — verify them before importing, ` +
+          `or use the full file instead.</div>`;
+      }
+      html += '<table class="preview"><thead><tr><th></th><th>Company</th><th>Rows</th>' +
         '<th>Source rows</th><th>Matched on</th><th>Source names</th></tr></thead><tbody>';
       data.duplicates.groups.forEach(g => {
-        html += `<tr><td>${escapeHtml(g.name)}</td><td>${g.size}</td>` +
+        const phoneOnly = g.matched_on.length === 1 && g.matched_on[0] === 'phone';
+        html += `<tr${phoneOnly ? ' class="needs-review"' : ''}>` +
+          `<td>${phoneOnly ? '<b title="merged on a phone match only">check</b>' : ''}</td>` +
+          `<td>${escapeHtml(g.name)}</td><td>${g.size}</td>` +
           `<td>${g.rows.join(', ')}</td><td>${escapeHtml(g.matched_on.join(', '))}</td>` +
           `<td>${escapeHtml(g.names.join(' | '))}</td></tr>`;
       });

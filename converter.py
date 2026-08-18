@@ -29,8 +29,10 @@ Two ideas drive most of the code:
 """
 import csv
 import io
+import os
 import re
 import unicodedata
+import zipfile
 from urllib.parse import urlparse, parse_qs, unquote, urlunparse
 
 import openpyxl
@@ -259,18 +261,31 @@ def phone_signature(p):
     return re.sub(r'\D', '', p or '')
 
 
+# A national number anywhere in this data is at most 10 digits (Mexico,
+# Colombia, Brazil, Spain, Russia all fit). From 11 digits up, the number
+# almost certainly already carries its country code, so adding '+' is safe.
+MAX_NATIONAL_DIGITS = 10
+MIN_INTERNATIONAL_DIGITS = 11
+
+
 def normalize_phone(raw, default_cc=None):
     """Ensure a phone string starts with '+'.
 
     Returns (value, status):
       'ok'       - already had a leading '+' (or 00 international prefix)
-      'fixed'    - we added '+' to a number that already looked international
+      'fixed'    - we added '+' to a number long enough to already carry a
+                   country code (>= MIN_INTERNATIONAL_DIGITS)
       'cc_added' - we prepended the operator-supplied default country code
                    because the number looked like a national number
-      'invalid'  - too few digits to trust; kept as-is and flagged
+      'needs_cc' - a national number and no default country code was given.
+                   Kept EXACTLY as it came, without a '+', and flagged.
+      'invalid'  - too few digits to be a phone number at all; kept as-is.
 
-    Note: 'fixed' is a *guess*. A bare 10-digit national number with no
-    country code is ambiguous, which is why `default_cc` exists.
+    Why 'needs_cc' exists: prefixing '+' to a national number invents a country.
+    '449 478 2400' is a local Mexican number, but '+449 478 2400' reads as
+    country code 44 (United Kingdom) - a plausible-looking number that can never
+    be dialled, which is worse than an obviously unformatted one. A number that
+    cannot be resolved is left alone and reported instead of being guessed.
     """
     raw = (raw or '').strip()
     digits = re.sub(r'\D', '', raw)
@@ -282,10 +297,15 @@ def normalize_phone(raw, default_cc=None):
         return '+' + raw[2:].strip(), 'ok'
 
     cc = re.sub(r'\D', '', default_cc or '')
-    if cc and len(digits) <= 10 and not digits.startswith(cc):
-        return '+' + cc + ' ' + raw, 'cc_added'
-    if len(digits) >= 8:
+    if cc and len(digits) <= MAX_NATIONAL_DIGITS and not digits.startswith(cc):
+        # A leading 0 is a national trunk prefix ("098 554 7600" dialled
+        # locally); it is never part of the international form.
+        national = raw.lstrip().lstrip('0').lstrip() or raw
+        return '+' + cc + ' ' + national, 'cc_added'
+    if len(digits) >= MIN_INTERNATIONAL_DIGITS and not digits.startswith('0'):
         return '+' + raw, 'fixed'
+    if len(digits) >= 7:
+        return raw, 'needs_cc'
     return raw, 'invalid'
 
 
@@ -627,14 +647,54 @@ class TableTooLargeError(Exception):
     pass
 
 
-MAX_ROWS = 200_000
-MAX_COLS = 300
+MAX_ROWS = int(os.environ.get('MAX_ROWS', 20_000))
+MAX_COLS = int(os.environ.get('MAX_COLS', 100))
+
+# The real guard. A .xlsx is a ZIP: 1.4 MB of file can hold 42 MB of sheet XML,
+# and openpyxl builds its whole object model before any row count is knowable,
+# so MAX_ROWS alone cannot stop a memory blow-up - it only fires once the RAM is
+# already spent. Measured on this parser: every MB of uncompressed XML costs
+# ~0.42 s of CPU and ~5 MB of retained RAM, and that held from 42 MB (18 s /
+# 212 MB) to 251 MB (106 s / 1293 MB). So one cap on the uncompressed size
+# bounds CPU and memory at once - and closes the zip-bomb hole for free.
+MAX_XLSX_UNCOMPRESSED = int(os.environ.get('MAX_XLSX_UNCOMPRESSED', 24 * 1024 * 1024))
+
+
+def check_xlsx_archive(path):
+    """Reject an .xlsx that would cost too much to parse, before parsing it.
+
+    Reads only the ZIP central directory - no XML is touched, so a hostile
+    file cannot attack the parser here."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            uncompressed = sum(i.file_size for i in z.infolist())
+    except zipfile.BadZipFile:
+        raise ValueError('Not a valid .xlsx file (it is not a ZIP archive).')
+    if uncompressed > MAX_XLSX_UNCOMPRESSED:
+        raise TableTooLargeError(
+            f'The file unpacks to {uncompressed // (1024 * 1024)} MB of internal XML, '
+            f'over the {MAX_XLSX_UNCOMPRESSED // (1024 * 1024)} MB limit. '
+            f'Split it into several smaller files.')
 
 
 def read_xlsx(path):
+    check_xlsx_archive(path)
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb.active
-    max_col = min(ws.max_column or 0, MAX_COLS)
+    # Only the active sheet is read. Silently dropping a populated sibling loses
+    # data the operator believes they uploaded - but an empty leftover "Sheet2"
+    # is normal in Excel and must not block anything, so only sheets that
+    # actually hold rows count.
+    other = [s.title for s in wb.worksheets
+             if s is not ws and (s.max_row or 0) > 1]
+    if other:
+        raise TableTooLargeError(
+            f'Only the active sheet ("{ws.title}") is imported, but these also '
+            f'contain data: {", ".join(other)}. Leave one sheet in the file, or '
+            f'upload each sheet separately.')
+    max_col = ws.max_column or 0
+    if max_col > MAX_COLS:
+        raise TableTooLargeError(f'Too many columns: {max_col} (limit {MAX_COLS}).')
     if (ws.max_row or 0) > MAX_ROWS:
         raise TableTooLargeError(f'Too many rows: {ws.max_row} (limit {MAX_ROWS}).')
     headers = []
@@ -656,16 +716,54 @@ def read_xlsx(path):
     return headers, rows, hyperlinks
 
 
-def read_csv_bytes(raw_bytes):
-    text = None
-    for enc in ('utf-8-sig', 'utf-8', 'cp1251', 'latin-1'):
+def _script_confusion(text):
+    """How many words mix Latin and Cyrillic letters.
+
+    That mixture is the signature of a single-byte codepage decoded with the
+    wrong table: CP1252 bytes read as CP1251 turn "Clínica México" into
+    "Clнnica Mйxico" - Cyrillic letters wedged inside Latin words. Real text is
+    almost never mixed inside one word, so the count is ~0 for a correct
+    decode and high for a wrong one."""
+    bad = 0
+    for word in re.findall(r'\w+', text):
+        has_latin = any('a' <= c.lower() <= 'z' for c in word)
+        has_cyrillic = any('Ѐ' <= c <= 'ӿ' for c in word)
+        if has_latin and has_cyrillic:
+            bad += 1
+    return bad
+
+
+def decode_csv_bytes(raw_bytes):
+    """Decode CSV bytes, picking between the single-byte codepages by content.
+
+    CP1251 and CP1252 cover the same byte range, so *both* always decode
+    without raising - trying them in order silently mangles whichever one
+    comes second. Spanish lead lists used to arrive as CP1252 and be read as
+    CP1251. Ties keep the earlier candidate, so Cyrillic files behave as before.
+    """
+    for enc in ('utf-8-sig', 'utf-8'):
         try:
-            text = raw_bytes.decode(enc)
-            break
+            return raw_bytes.decode(enc), enc
         except UnicodeDecodeError:
             continue
-    if text is None:
-        text = raw_bytes.decode('utf-8', errors='replace')
+    best, best_enc, best_score = None, None, None
+    for enc in ('cp1251', 'cp1252', 'latin-1'):
+        try:
+            candidate = raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        score = _script_confusion(candidate)
+        if best_score is None or score < best_score:
+            best, best_enc, best_score = candidate, enc, score
+        if best_score == 0:
+            break
+    if best is None:
+        return raw_bytes.decode('utf-8', errors='replace'), 'utf-8'
+    return best, best_enc
+
+
+def read_csv_bytes(raw_bytes):
+    text, _encoding = decode_csv_bytes(raw_bytes)
 
     sample = text[:4096]
     try:
@@ -680,7 +778,9 @@ def read_csv_bytes(raw_bytes):
         return [], [], []
     if len(data) > MAX_ROWS:
         raise TableTooLargeError(f'Too many rows: {len(data)} (limit {MAX_ROWS}).')
-    headers = [clean_text(h) or f'Column {i + 1}' for i, h in enumerate(data[0][:MAX_COLS])]
+    if len(data[0]) > MAX_COLS:
+        raise TableTooLargeError(f'Too many columns: {len(data[0])} (limit {MAX_COLS}).')
+    headers = [clean_text(h) or f'Column {i + 1}' for i, h in enumerate(data[0])]
     width = len(headers)
     rows = []
     for r in data[1:]:
@@ -690,23 +790,23 @@ def read_csv_bytes(raw_bytes):
     return headers, rows, hyperlinks
 
 
+def _read_csv_file(path):
+    with open(path, 'rb') as f:
+        return read_csv_bytes(f.read())
+
+
 def read_table(path, filename):
     lower = filename.lower()
-    if lower.endswith('.xlsx') or lower.endswith('.xlsm'):
-        return read_xlsx(path)
     if lower.endswith('.csv') or lower.endswith('.txt'):
-        with open(path, 'rb') as f:
-            raw = f.read()
-        return read_csv_bytes(raw)
-    # fall back: try xlsx first, then csv
+        return _read_csv_file(path)
     try:
         return read_xlsx(path)
     except TableTooLargeError:
         raise
-    except Exception:
-        with open(path, 'rb') as f:
-            raw = f.read()
-        return read_csv_bytes(raw)
+    except ValueError:
+        # Not a ZIP, so not really a spreadsheet. Operators do rename a CSV to
+        # .xlsx; reading it as CSV is friendlier than "File is not a zip file".
+        return _read_csv_file(path)
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +911,7 @@ def scan_phones(headers, rows, phone_col_indices, default_cc=None):
     for c in phone_col_indices:
         per_row = []
         leftovers = []
-        stats = {'ok': 0, 'fixed': 0, 'cc_added': 0, 'invalid': 0,
+        stats = {'ok': 0, 'fixed': 0, 'cc_added': 0, 'needs_cc': 0, 'invalid': 0,
                  'overflow': 0, 'foreign_emails': 0, 'foreign_urls': 0, 'empty': 0}
         max_count = 1
         for row in rows:
@@ -943,15 +1043,61 @@ DEFAULT_OPTIONS = {
 }
 
 
+# A mappable source column is "<col>" or "<col>:<phone sub-column>".
+SOURCE_KEY_RE = re.compile(r'^\d{1,4}(:\d{1,2})?$')
+
+_BOOL_OPTIONS = ('autofix_types', 'skip_rows_without_name', 'sanitize_formulas',
+                 'transliterate', 'dedupe_by_name', 'dedupe_by_email',
+                 'dedupe_by_phone', 'dedupe_by_website')
+
+
 def normalize_options(opts):
+    """Coerce client-supplied options into the types the pipeline assumes.
+
+    Everything here arrives as JSON from the browser, so nothing about its type
+    is guaranteed: a list instead of an object used to raise AttributeError, and
+    a dict in `source_value` reached csv writing and died there - both as a 500.
+    """
+    if opts is not None and not isinstance(opts, dict):
+        raise ValueError('options must be an object.')
     o = dict(DEFAULT_OPTIONS)
     for k, v in (opts or {}).items():
         if k in o:
             o[k] = v
-    o['default_country_code'] = re.sub(r'\D', '', str(o['default_country_code'] or ''))
+    for k in _BOOL_OPTIONS:
+        o[k] = bool(o[k])
+    o['default_country_code'] = re.sub(r'\D', '', str(o['default_country_code'] or ''))[:4]
+    o['source_value'] = clean_text(o['source_value'])[:100] or SOURCE_VALUE
     if o['csv_encoding'] not in CSV_ENCODING_IDS:
         o['csv_encoding'] = CSV_ENCODING
     return o
+
+
+def _text_for_key(key, row_idx, rows, phone_data):
+    """Just the cell text for a source key - no atom extraction.
+
+    A text-typed target uses nothing but `atoms['text']`, yet _atoms_for_key
+    runs every e-mail/URL/phone regex first and the results are discarded
+    (build_records skips the autofix block for text targets). Since rows[] is
+    already clean_text'd by the reader, this collapses to one list index.
+    Measured: 2.1x off build_records, byte-identical output."""
+    if ':' in key:
+        col_str, sub_str = key.split(':')
+        c, sub = int(col_str), int(sub_str)
+        info = phone_data.get(c)
+        if not info:
+            return None
+        per_row = info['per_row']
+        vals = per_row[row_idx] if row_idx < len(per_row) else []
+        value = vals[sub] if sub < len(vals) else ''
+        if value:
+            return value
+        if sub == 0 and row_idx < len(rows) and c < len(rows[row_idx]):
+            return rows[row_idx][c]
+        return ''
+    c = int(key)
+    row = rows[row_idx] if row_idx < len(rows) else []
+    return row[c] if c < len(row) else ''
 
 
 def _atoms_for_key(key, row_idx, rows, hyperlinks, phone_data, default_cc):
@@ -1016,10 +1162,18 @@ def build_records(headers, rows, hyperlinks, phone_data, mapping, options=None,
     autofix = bool(opts['autofix_types'])
     default_cc = opts['default_country_code']
 
+    if mapping is not None and not isinstance(mapping, dict):
+        raise ValueError('mapping must be an object of source key -> target id.')
+
     by_target = {}
     for key, target_id in (mapping or {}).items():
         if not target_id or target_id not in TARGET_BY_ID:
             continue
+        if not SOURCE_KEY_RE.match(str(key)):
+            # Keys come from the client. Without this, int() further down turns
+            # 'abc', '1:2:3' or '-1' into a 500 - or, for '-1', silently reads
+            # the last column instead of the one asked for.
+            raise ValueError(f'Invalid source column key: {key!r}')
         by_target.setdefault(target_id, []).append(key)
     # stable, UI order
     for t in by_target:
@@ -1035,15 +1189,16 @@ def build_records(headers, rows, hyperlinks, phone_data, mapping, options=None,
         for target_id, keys in by_target.items():
             ttype = TARGET_BY_ID[target_id]['type']
             for key in keys:
+                if ttype == 'text':
+                    text = _text_for_key(key, row_idx, rows, phone_data)
+                    if text:
+                        buckets[target_id].append(text)
+                    continue
+
                 atoms = _atoms_for_key(key, row_idx, rows, hyperlinks, phone_data, default_cc)
                 if atoms is None:
                     continue
                 label = labels.get(key, key)
-
-                if ttype == 'text':
-                    if atoms['text']:
-                        buckets[target_id].append(atoms['text'])
-                    continue
 
                 own = {'email': atoms['emails'],
                        'phone': atoms['phones'],
@@ -1148,8 +1303,16 @@ def records_to_rows(records, sanitize_formulas=False, transliterate=False):
     return rows
 
 
+# "+52 33 1234 5678" starts with '+' but cannot be a formula - only digits and
+# separators follow. Exempting it keeps phone numbers intact when formula
+# protection is on, which is why that option used to be unusable for a CRM import.
+PHONE_SHAPED_RE = re.compile(r'^\+[\d\s()\-.]+$')
+
+
 def _escape_formula(v):
-    if isinstance(v, str) and v[:1] in ('=', '+', '-', '@', '\t', '\r'):
+    if not isinstance(v, str):
+        return v
+    if v[:1] in ('=', '+', '-', '@', '\t', '\r') and not PHONE_SHAPED_RE.match(v):
         return "'" + v
     return v
 
@@ -1365,13 +1528,24 @@ def _infer_reasons(members, opts):
     return reasons
 
 
+# Only these hold ', '-joined lists of atoms. Everything else is free text,
+# where a comma is punctuation: splitting "Call Monday, urgent" into two values
+# and de-duplicating them against another row silently deletes words.
+MULTI_VALUE_OUTPUTS = set(PHONE_OUTPUTS) | set(EMAIL_OUTPUTS) | set(URL_OUTPUTS)
+
+
 def _merge_group(members, opts):
     rec = {h: '' for h in OUTPUT_HEADERS}
     best = pick_best_name([m.get('Company Name', '') for m in members])
     for h in OUTPUT_HEADERS:
         values = []
         for m in members:
-            values.extend(_split_multi(m.get(h, '')) if h != 'Source' else [m.get(h, '')])
+            if h in MULTI_VALUE_OUTPUTS:
+                values.extend(_split_multi(m.get(h, '')))
+            else:
+                v = (m.get(h) or '').strip()
+                if v:
+                    values.append(v)
         if h in ('Company Name', 'Lead Name'):
             rec[h] = best
         elif h in PHONE_OUTPUTS:
@@ -1400,7 +1574,8 @@ def duplicates_report_rows(groups):
     rows = []
     for i, g in enumerate(groups, start=1):
         for row_no, name in zip(g['rows'], g['names']):
-            rows.append([str(i), g['name'], str(g['size']), str(row_no), name,
+            rows.append([str(i), _escape_formula(g['name']), str(g['size']),
+                         str(row_no), _escape_formula(name),
                          ', '.join(g['matched_on'])])
     return rows
 
@@ -1416,8 +1591,9 @@ def fixes_report_rows(fixes):
     rows = []
     for f in fixes:
         rows.append([
-            str(f['row']), f['column'], _KIND_LABEL.get(f['kind'], f['kind']),
-            f['value'],
+            str(f['row']), _escape_formula(f['column']),
+            _KIND_LABEL.get(f['kind'], f['kind']),
+            _escape_formula(f['value']),
             TARGET_BY_ID[f['from']]['label'] if f['from'] in TARGET_BY_ID else f['from'],
             TARGET_BY_ID[f['to']]['label'] if f['to'] in TARGET_BY_ID else '',
             _ACTION_LABEL.get(f['action'], f['action']),
@@ -1450,13 +1626,19 @@ def write_csv(path, rows, headers=None, encoding=None):
             replaced += row_replaced
         safe_rows.append(safe)
 
-    with open(path, 'w', newline='', encoding=enc) as f:
+    # Write-then-rename: the download route serves this exact path, so writing
+    # in place would let a client fetch a half-written file, or a mix of two
+    # conversions. os.replace() is atomic within a filesystem.
+    tmp_path = path + '.tmp'
+    with open(tmp_path, 'w', newline='', encoding=enc) as f:
         writer = csv.writer(
             f, delimiter=CSV_DELIMITER, lineterminator=CSV_LINETERMINATOR,
             quoting=csv.QUOTE_MINIMAL,
         )
         writer.writerow(headers if headers is not None else OUTPUT_HEADERS)
         writer.writerows(safe_rows)
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
     return {'encoding': enc, 'replaced': replaced, 'affected_rows': affected_rows}
 
 
