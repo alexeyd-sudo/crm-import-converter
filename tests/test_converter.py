@@ -421,8 +421,20 @@ def test_formula_sanitizing():
     assert safe[0] == "'=cmd|calc"
     # A phone number is not a formula: '+' followed only by digits and
     # separators cannot execute. Quoting it used to make this option unusable
-    # for a CRM import, so phone-shaped values are left alone.
-    assert safe[2] == '+52 331 111 1111'
+    # for a CRM import, so phone-shaped values are left alone (the leading
+    # comma records_to_rows() adds for Bitrix isn't a formula trigger either).
+    assert safe[2] == ',+52 331 111 1111'
+
+
+def test_phone_cells_get_the_bitrix_comma_prefix():
+    """Bitrix24 only binds a phone value on import when the cell starts with
+    a bare comma - '+79223363661' alone is silently ignored."""
+    recs = [{h: '' for h in C.OUTPUT_HEADERS}]
+    recs[0]['Mobile Phone'] = '+79223363661'
+    recs[0]['Home Phone'] = '+79223363661, +79161234567, +71234567890'
+    row = C.records_to_rows(recs)[0]
+    assert row[2] == ',+79223363661'
+    assert row[3] == ',+79223363661 ,+79161234567 ,+71234567890'
     assert C._escape_formula('+52 (33) 1234-5678') == '+52 (33) 1234-5678'
     assert C._escape_formula('+SUM(A1:A2)') == "'+SUM(A1:A2)"
     assert C._escape_formula('-1+1') == "'-1+1"

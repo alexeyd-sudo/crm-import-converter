@@ -1338,10 +1338,33 @@ def _strip_cross_field_duplicates(record):
             record[col] = joiner(kept)
 
 
+def _format_phone_cell(v):
+    """Bitrix24's CRM import only binds a phone value when the cell carries
+    a leading comma - the empty 'type' slot of its multi-value field format.
+    A bare '+79223363661' is silently ignored on import; ',+79223363661' is
+    read correctly. Everything upstream of this point (dedupe, cross-field
+    duplicate stripping, merging) still works on the plain '+'-prefixed
+    numbers joined by ', ' - this only reformats the string right before it
+    is written to CSV. When more than one number ends up in the same output
+    cell (once the dedicated Mobile/Home/Other Phone columns run out), each
+    number keeps its own comma and they are separated by a plain space:
+    ',+A ,+B ,+C'.
+    """
+    if not v:
+        return v
+    parts = [p.strip() for p in v.split(',') if p.strip()]
+    return ' '.join(',' + p for p in parts)
+
+
 def records_to_rows(records, sanitize_formulas=False, transliterate=False):
     rows = []
     for rec in records:
-        row = [rec.get(h, '') for h in OUTPUT_HEADERS]
+        row = []
+        for h in OUTPUT_HEADERS:
+            v = rec.get(h, '')
+            if h in PHONE_OUTPUTS:
+                v = _format_phone_cell(v)
+            row.append(v)
         if transliterate:
             row = [strip_accents(v) for v in row]
         if sanitize_formulas:
