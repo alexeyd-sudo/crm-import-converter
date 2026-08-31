@@ -168,6 +168,8 @@ def extract_emails(val):
 URL_RE = re.compile(r'https?://\S+')
 WAME_RE = re.compile(r'wa\.me/\S+', re.IGNORECASE)
 CTRL_ARTIFACT_RE = re.compile(r'(?:_x00[0-9A-Fa-f]{2}_)+')
+# Straight and typographic single/double quotes.
+QUOTE_RE = re.compile(r'[\'"‘’‚‛“”„‟]')
 
 # Word-ish keywords. Matched with a boundary check (see looks_like_phone_header)
 # so that "wa" does not fire on "Warehouse" and "tel" does not fire on "Hotel".
@@ -213,6 +215,46 @@ def _clean_phone_candidate(c):
     return c
 
 
+def _split_phone_run(s):
+    """Break a whitespace-joined run into separate phone numbers.
+
+    People paste several numbers with nothing but a space between them
+    ('+487765543 +36706709874'), while a *single* number is routinely
+    written with spaces as digit-group separators ('+52 449 478 2400').
+    A plain space can't tell those apart, so a new number is only started
+    where something else marks it:
+      - a '+' that isn't the first token - '+' opens a number, it never
+        sits in the middle of one;
+      - a '00' international-dialling prefix followed by enough digits to
+        be a number on its own (not just a stray '00...' digit group);
+      - a token that already looks like a complete number (>= 7 digits)
+        showing up right after a group that is already complete-looking
+        itself (>= MIN_INTERNATIONAL_DIGITS digits) - two full numbers
+        typed back to back with no punctuation at all.
+    Anything else (short digit groups such as '449', '478') is treated as
+    part of the number currently being assembled.
+    """
+    tokens = [t for t in re.split(r'\s+', s.strip()) if t]
+    out = []
+    cur, cur_digits = [], 0
+    for tok in tokens:
+        tok_digits = len(re.sub(r'\D', '', tok))
+        new_number = bool(cur) and (
+            tok.startswith('+')
+            or re.match(r'^00\d{7,}', tok)
+            or (cur_digits >= MIN_INTERNATIONAL_DIGITS and tok_digits >= 7)
+        )
+        if new_number:
+            out.append(' '.join(cur))
+            cur, cur_digits = [tok], tok_digits
+        else:
+            cur.append(tok)
+            cur_digits += tok_digits
+    if cur:
+        out.append(' '.join(cur))
+    return out
+
+
 def extract_phone_candidates(val):
     """Pull out every phone-like substring from a cell, cleaned but not yet
     '+'-normalized. Order preserved, de-duplicated by digit signature."""
@@ -220,6 +262,10 @@ def extract_phone_candidates(val):
         return []
     s = unicodedata.normalize('NFKC', str(val))
     s = CTRL_ARTIFACT_RE.sub('', s)
+    # Quotes never belong to a phone number - only ever wrap or separate
+    # one (copy-pasted from JSON/code). Turn them into a hard boundary
+    # rather than leaving them stuck to a digit run.
+    s = QUOTE_RE.sub(' ', s)
 
     phones = []
     for m in WAME_RE.findall(s):
@@ -236,15 +282,16 @@ def extract_phone_candidates(val):
     # e-mails before looking for numbers
     s = EMAIL_RE.sub(' ', fix_email_typos(s))
 
-    for part in re.split(r'[/&,;]', s):
+    for part in re.split(r'[/&,;|]+', s):
         part = part.strip()
         if not part:
             continue
         main, extras = _split_parens(part)
         for cand in [main] + extras:
-            cleaned = _clean_phone_candidate(cand)
-            if cleaned:
-                phones.append(cleaned)
+            for run in _split_phone_run(cand):
+                cleaned = _clean_phone_candidate(run)
+                if cleaned:
+                    phones.append(cleaned)
 
     seen = set()
     out = []
