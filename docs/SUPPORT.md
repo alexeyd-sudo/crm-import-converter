@@ -94,7 +94,7 @@ a preview of the first 5 rows of each file.
 * Line endings — `CRLF`
 * Quotes — only where they are needed
 * 14 fixed columns:
-  `Company Name; Lead Name; Mobile Phone; Home Phone; Other Phone Number;
+  `Company Name; Lead Name; Mobile; Home Phone; Other Phone Number;
   Corporate Website; Other Website; Work E-mail; Home E-mail; Other E-mail;
   Country OUTREACH; Outreach comment; Comment; Source`
 

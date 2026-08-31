@@ -135,7 +135,7 @@ def test_swapped_email_and_phone_are_restored():
     ])
     r = records[0]
     assert r['Work E-mail'] == 'ventas@alpha.mx'
-    assert r['Mobile Phone'] == '+52 33 1234 5678'
+    assert r['Mobile'] == '+52 33 1234 5678'
     assert r['Corporate Website'] == 'https://alpha.com.mx'
     assert {f['kind'] for f in fixes} == {'email', 'phone'}
     assert all(f['action'] == 'moved' for f in fixes)
@@ -147,7 +147,7 @@ def test_url_in_phone_column_goes_to_a_website_field():
         ['Beta', 'b@beta.cl', '+56911110008 / https://instagram.com/beta.cl', 'https://beta.cl'],
     ])
     r = records[0]
-    assert r['Mobile Phone'] == '+56911110008'
+    assert r['Mobile'] == '+56911110008'
     assert r['Corporate Website'] == 'https://beta.cl'
     assert 'instagram.com/beta.cl' in r['Other Website']
     assert [f['action'] for f in fixes] == ['moved']
@@ -223,8 +223,8 @@ def test_dedupe_by_name_with_handle_in_parens():
     ])
     assert len(merged) == 1
     assert merged[0]['Company Name'] == 'Distribuidora Alpha (distribuidora_alpha_mx)'
-    assert '+52 3311110001' in merged[0]['Mobile Phone']
-    assert '+52 3311110003' in merged[0]['Mobile Phone']
+    assert '+52 3311110001' in merged[0]['Mobile']
+    assert '+52 3311110003' in merged[0]['Mobile']
     assert groups[0]['size'] == 2
 
 
@@ -299,7 +299,7 @@ def test_same_phone_in_two_fields_is_kept_once():
         ['Alpha', '+52 331 111 1111', '+52 331 111 1111'],
     ])
     r = records[0]
-    assert r['Mobile Phone'] == '+52 331 111 1111'
+    assert r['Mobile'] == '+52 331 111 1111'
     assert r['Home Phone'] == ''
 
 
@@ -414,7 +414,7 @@ def test_unknown_encoding_falls_back_to_default():
 def test_formula_sanitizing():
     recs = [{h: '' for h in C.OUTPUT_HEADERS}]
     recs[0]['Company Name'] = '=cmd|calc'
-    recs[0]['Mobile Phone'] = '+52 331 111 1111'
+    recs[0]['Mobile'] = '+52 331 111 1111'
     plain = C.records_to_rows(recs, sanitize_formulas=False)[0]
     safe = C.records_to_rows(recs, sanitize_formulas=True)[0]
     assert plain[0] == '=cmd|calc'
@@ -430,7 +430,7 @@ def test_phone_cells_get_the_bitrix_comma_prefix():
     """Bitrix24 only binds a phone value on import when the cell starts with
     a bare comma - '+79223363661' alone is silently ignored."""
     recs = [{h: '' for h in C.OUTPUT_HEADERS}]
-    recs[0]['Mobile Phone'] = '+79223363661'
+    recs[0]['Mobile'] = '+79223363661'
     recs[0]['Home Phone'] = '+79223363661, +79161234567, +71234567890'
     row = C.records_to_rows(recs)[0]
     assert row[2] == ',+79223363661'
@@ -581,7 +581,7 @@ def test_merging_does_not_split_free_text_on_commas():
          ['Acme', '+52 33 1111 1111'],
          ['Acme', '+52 33 1111 1111, +52 33 2222 2222']],
         mapping={'0': 'company_lead', '1:0': 'mobile_phone', '1:1': 'mobile_phone'})
-    assert merged2[0]['Mobile Phone'].count('+') == 2, merged2[0]['Mobile Phone']
+    assert merged2[0]['Mobile'].count('+') == 2, merged2[0]['Mobile']
 
 
 def test_reports_are_always_protected_from_formulas():

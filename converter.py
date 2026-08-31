@@ -45,7 +45,7 @@ TARGET_FIELDS = [
     {'id': 'company_lead', 'label': 'Company Name / Lead Name', 'type': 'text',
      'outputs': ['Company Name', 'Lead Name'],
      'hint': 'The value is written to 2 result columns at once: Company Name and Lead Name'},
-    {'id': 'mobile_phone', 'label': 'Mobile Phone', 'type': 'phone', 'outputs': ['Mobile Phone'], 'hint': ''},
+    {'id': 'mobile_phone', 'label': 'Mobile', 'type': 'phone', 'outputs': ['Mobile'], 'hint': ''},
     {'id': 'home_phone', 'label': 'Home Phone', 'type': 'phone', 'outputs': ['Home Phone'], 'hint': ''},
     {'id': 'other_phone', 'label': 'Other Phone Number', 'type': 'phone', 'outputs': ['Other Phone Number'], 'hint': ''},
     {'id': 'corporate_website', 'label': 'Corporate Website', 'type': 'url', 'outputs': ['Corporate Website'], 'hint': ''},
@@ -61,7 +61,7 @@ TARGET_BY_ID = {t['id']: t for t in TARGET_FIELDS}
 
 OUTPUT_HEADERS = [
     'Company Name', 'Lead Name',
-    'Mobile Phone', 'Home Phone', 'Other Phone Number',
+    'Mobile', 'Home Phone', 'Other Phone Number',
     'Corporate Website', 'Other Website',
     'Work E-mail', 'Home E-mail', 'Other E-mail',
     'Country OUTREACH', 'Outreach comment', 'Comment',
@@ -77,7 +77,7 @@ TYPE_CHAINS = {
     'url': ['corporate_website', 'other_website'],
 }
 
-PHONE_OUTPUTS = ['Mobile Phone', 'Home Phone', 'Other Phone Number']
+PHONE_OUTPUTS = ['Mobile', 'Home Phone', 'Other Phone Number']
 EMAIL_OUTPUTS = ['Work E-mail', 'Home E-mail', 'Other E-mail']
 URL_OUTPUTS = ['Corporate Website', 'Other Website']
 
